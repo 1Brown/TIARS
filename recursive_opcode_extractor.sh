@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Usage:
+#   ./extract_opcodes_recursive_archives.sh /path/to/dataset_root [/path/to/output_root] [/path/to/analyzeHeadless]
+#
+# Example:
+#   ./extract_opcodes_recursive_archives.sh "$HOME/APT_EXTRACTED" "$HOME/opcodes_out" /opt/ghidra/support/analyzeHeadless
+
 DATASET_ROOT="${1:-}"
 OUT_ROOT="${2:-$HOME/opcodes_out}"
 ANALYZE_HEADLESS="${3:-/opt/ghidra/support/analyzeHeadless}"
 PASSWORD="infected"
 
+# Safety caps (avoid archive bombs)
 MAX_NESTING="${MAX_NESTING:-5}"
 MAX_FILES_PER_ARCHIVE="${MAX_FILES_PER_ARCHIVE:-5000}"
 
@@ -17,6 +24,7 @@ fi
 for cmd in file unzip 7z find mktemp; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "Missing dependency: $cmd"
+    echo "Install: sudo apt install -y p7zip-full unzip file"
     exit 1
   }
 done
@@ -28,16 +36,14 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GHIDRA_SCRIPTS_DIR="$SCRIPT_DIR/ghidra_scripts"
-[[ -f "$GHIDRA_SCRIPTS_DIR/DumpOpcodes.java" ]] || {
-  echo "Missing: $GHIDRA_SCRIPTS_DIR/DumpOpcodes.java"
-  exit 1
-}
+[[ -f "$GHIDRA_SCRIPTS_DIR/DumpOpcodes.java" ]] || { echo "Missing: $GHIDRA_SCRIPTS_DIR/DumpOpcodes.java"; exit 1; }
 
 mkdir -p "$OUT_ROOT"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 sanitize() {
+  # spaces/slashes -> underscore, strip weird chars
   echo "$1" | tr ' /' '__' | tr -cd 'A-Za-z0-9._-'
 }
 
@@ -60,16 +66,19 @@ extract_archive() {
   fi
 }
 
+# Only process actual executables (prevents feeding docs/metadata to Ghidra)
 should_process_binary() {
   local f="$1"
   [[ -s "$f" ]] || return 1
   local desc
   desc="$(file -b "$f" 2>/dev/null || true)"
 
+  # skip obvious text/scripts
   if echo "$desc" | grep -Eqi 'ASCII text|Unicode text|UTF-8 text|script|JSON|XML|HTML'; then
     return 1
   fi
 
+  # accept common executable formats
   if echo "$desc" | grep -Eqi 'PE32|PE32\+|ELF|Mach-O|executable|shared object|MS-DOS|COM executable'; then
     return 0
   fi
@@ -120,14 +129,60 @@ for arch in "${ARCHIVES[@]}"; do
 
   stage="$(mktemp -d -p "$WORK_DIR" stage_XXXXXX)"
 
-  # ---------------------------
-  # NEW BEHAVIOR: DO NOT STOP ON FAILURE
-  # ---------------------------
+  # Try to extract archive into stage
   if ! extract_archive "$arch" "$stage" 2>/dev/null; then
-    echo "[!] Extract failed for $rel — scanning folder anyway"
+    echo "[-] Extract failed: $rel"
+    fail_count=$((fail_count+1))
+
+    # NEW BEHAVIOR: scan the archive's directory for binaries anyway
+    arch_dir="$(dirname "$arch")"
+    echo "[*] Scanning archive directory for binaries: $arch_dir"
+
+    mapfile -t DIR_FILES < <(find "$arch_dir" -maxdepth 1 -type f | sort)
+    for f in "${DIR_FILES[@]}"; do
+      # Skip the archive itself
+      [[ "$f" == "$arch" ]] && continue
+
+      if ! should_process_binary "$f"; then
+        continue
+      fi
+
+      binary_count=$((binary_count+1))
+      base="$(basename "$f")"
+      name="${base%.*}"
+      name_s="$(sanitize "$name")"
+
+      out_file="${group_s}__${name_s}.opcode"
+      out_path="$OUT_ROOT/$group_s/$out_file"
+
+      echo "[*] BIN (fallback): $base -> $out_path"
+
+      if run_ghidra "$f" "$out_path"; then
+        if [[ -s "$out_path" ]]; then
+          ok_count=$((ok_count+1))
+          echo "[+] OK"
+        else
+          echo "[!] Empty output (kept): $out_path"
+        fi
+      else
+        echo "[-] Ghidra failed: $base"
+        fail_count=$((fail_count+1))
+      fi
+    done
+
+    echo
+    continue
   fi
 
-  # nested extraction (only if extraction succeeded)
+  file_total="$(find "$stage" -type f | wc -l | tr -d ' ')"
+  if [[ "$file_total" -gt "$MAX_FILES_PER_ARCHIVE" ]]; then
+    echo "[-] Too many extracted files ($file_total). Skipping (cap=$MAX_FILES_PER_ARCHIVE)"
+    fail_count=$((fail_count+1))
+    echo
+    continue
+  fi
+
+  # nested extraction
   for ((depth=1; depth<=MAX_NESTING; depth++)); do
     mapfile -t NESTED < <(find "$stage" -type f \( -iname "*.zip" -o -iname "*.7z" \) | sort)
     [[ ${#NESTED[@]} -eq 0 ]] && break
@@ -136,24 +191,14 @@ for arch in "${ARCHIVES[@]}"; do
     for narch in "${NESTED[@]}"; do
       ndir="${narch}.d"
       if extract_archive "$narch" "$ndir" 2>/dev/null; then
-        rm -f "$narch"
+        rm -f "$narch"   # prevent re-processing
       else
         echo "[!] Failed nested extract: ${narch#$stage/}"
       fi
     done
   done
 
-  # ---------------------------
-  # NEW BEHAVIOR: ALWAYS SCAN FOR BINARIES
-  # ---------------------------
   mapfile -t FILES < <(find "$stage" -type f | sort)
-
-  if [[ ${#FILES[@]} -eq 0 ]]; then
-    echo "[!] No files found in stage directory"
-    echo
-    continue
-  fi
-
   for f in "${FILES[@]}"; do
     if ! should_process_binary "$f"; then
       continue
@@ -164,11 +209,12 @@ for arch in "${ARCHIVES[@]}"; do
     name="${base%.*}"
     name_s="$(sanitize "$name")"
 
+    # Filename includes group name:
+    # <GROUP>__<sample>.opcode
     out_file="${group_s}__${name_s}.opcode"
     out_path="$OUT_ROOT/$group_s/$out_file"
 
     echo "[*] BIN: $base -> $out_path"
-
     if run_ghidra "$f" "$out_path"; then
       if [[ -s "$out_path" ]]; then
         ok_count=$((ok_count+1))
